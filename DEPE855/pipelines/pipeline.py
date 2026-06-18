@@ -6,35 +6,98 @@ import hashlib
 import pandas as pd
 import pyarrow.parquet as pq
 import pyarrow as pa
+from hdfs3 import HDFileSystem
 
 
 # ==================== CONFIG ====================
+# Use HDFS if configured, otherwise fall back to local filesystem
+HDFS_HOST = os.getenv("HDFS_HOST", "")
+HDFS_PORT = int(os.getenv("HDFS_PORT", "8020"))
+USE_HDFS = bool(HDFS_HOST)
+
 RAW_DIR = "output/raw"
 PROCESSED_DIR = "output/processed"
 FAKE_NEWS_API_KEY = os.getenv("FAKE_NEWS_API_KEY", "")
 FAKE_NEWS_API_URL = "https://api.fakenewsdetector.com/v1/score"
 
+# Initialize HDFS connection if configured
+_hdfs = None
+if USE_HDFS:
+    _hdfs = HDFileSystem(host=HDFS_HOST, port=HDFS_PORT)
+
+
+def _hdfs_exists(path: str) -> bool:
+    """Check if path exists in HDFS."""
+    if not USE_HDFS:
+        return Path(path).exists()
+    return _hdfs.exists(path)
+
+
+def _hdfs_ls(path: str) -> list[str]:
+    """List files in HDFS directory."""
+    if not USE_HDFS:
+        return [str(p) for p in Path(path).glob("**/*.json")]
+    return _hdfs.ls(path, detail=False)
+
+
+def _hdfs_read_text(path: str) -> str:
+    """Read file from HDFS."""
+    if not USE_HDFS:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    with _hdfs.open(path, "rb") as f:
+        return f.read().decode("utf-8")
+
+
+def _hdfs_write_parquet(df: pd.DataFrame, path: str):
+    """Write DataFrame to Parquet in HDFS."""
+    if not USE_HDFS:
+        df.to_parquet(path, index=False)
+    else:
+        with _hdfs.open(path, "wb") as f:
+            df.to_parquet(f, index=False)
+
+
+def _hdfs_write_csv(df: pd.DataFrame, path: str):
+    """Write DataFrame to CSV in HDFS."""
+    if not USE_HDFS:
+        df.to_csv(path, index=False)
+    else:
+        with _hdfs.open(path, "wb") as f:
+            df.to_csv(f, index=False)
+
+
+def _hdfs_mkdir(path: str):
+    """Create directory in HDFS."""
+    if not USE_HDFS:
+        Path(path).mkdir(parents=True, exist_ok=True)
+    else:
+        _hdfs.makedirs(path)
+
+
 # ==================== HELPERS ====================
 
 def load_raw_data(raw_dir: str) -> list[dict]:
-    """Load all JSON files from output/raw/*/ directories."""
+    """Load all JSON files from output/raw/*/ directories (local or HDFS)."""
     raw_data = []
-    raw_path = Path(raw_dir)
 
-    if not raw_path.exists():
+    if not _hdfs_exists(raw_dir):
         print(f"Warning: {raw_dir} does not exist. Creating...")
-        raw_path.mkdir(parents=True, exist_ok=True)
+        _hdfs_mkdir(raw_dir)
         return raw_data
 
-    # Walk through all subdirectories
-    for json_file in raw_path.glob("**/*.json"):
+    # Get all JSON files recursively
+    all_files = _hdfs_ls(raw_dir)
+    json_files = [f for f in all_files if f.endswith(".json")]
+
+    for json_file in json_files:
         try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    raw_data.extend(data)
-                else:
-                    raw_data.append(data)
+            content = _hdfs_read_text(json_file)
+            data = json.loads(content)
+            if isinstance(data, list):
+                raw_data.extend(data)
+            else:
+                raw_data.append(data)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             print(f"Warning: Could not load {json_file}: {e}")
 
@@ -44,24 +107,20 @@ def load_raw_data(raw_dir: str) -> list[dict]:
 def standardize_date(date_str: str) -> str:
     """Convert various date formats to YYYY-MM-DD."""
     if not date_str or date_str.lower() in ("no date", "none", ""):
-        return "1970-01-01"  # Default for missing dates
+        return "1970-01-01"
 
-    # Already ISO format
     if date_str.count("-") == 2 and len(date_str) == 10:
         return date_str
 
-    # DD/MM/YYYY or MM/DD/YYYY
     if "/" in date_str:
         parts = date_str.split("/")
         if len(parts) == 3:
-            # Assume DD/MM/YYYY
             day, month, year = parts
             try:
                 return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
             except (ValueError, AttributeError):
                 pass
 
-    # Try parsing with datetime
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
         return dt.strftime("%Y-%m-%d")
@@ -74,7 +133,6 @@ def standardize_date(date_str: str) -> str:
     except ValueError:
         pass
 
-    # Fallback: return original
     print(f"Warning: Could not parse date '{date_str}', using default")
     return "1970-01-01"
 
@@ -92,20 +150,13 @@ def clean_text(text: str) -> str:
 
 
 def get_verification_score(item: dict, afp_data: list[dict]) -> float:
-    """
-    Calculate verification score for an item.
-    - Cross-check with AFP fact checks
-    - Use Fake News API
-    - Boost score if multiple sources report same event
-    """
-    base_score = 0.5  # Neutral starting point
+    """Calculate verification score for an item."""
+    base_score = 0.5
 
-    # Check against AFP fact checks
     afp_verified = False
     for afp_item in afp_data:
         if (afp_item.get("title") == item.get("title") and
                 afp_item.get("date") == item.get("date")):
-            # If AFP marks it as true, trust it
             afp_rating = afp_item.get("rating", "").lower()
             if "true" in afp_rating or "real" in afp_rating:
                 base_score = 0.95
@@ -115,7 +166,6 @@ def get_verification_score(item: dict, afp_data: list[dict]) -> float:
                 afp_verified = True
             break
 
-    # Call Fake News Detector API
     fake_news_score = 0.5
     if FAKE_NEWS_API_KEY and item.get("title"):
         try:
@@ -132,18 +182,15 @@ def get_verification_score(item: dict, afp_data: list[dict]) -> float:
         except Exception as e:
             print(f"Warning: Fake News API error: {e}")
 
-    # Combine scores
     verification_score = (base_score + fake_news_score) / 2
-
-    # Boost if AFP verified
     if afp_verified:
-        verification_score = base_score  # Use AFP's determination
+        verification_score = base_score
 
     return round(verification_score, 2)
 
 
-def count_source_duplicates(items: list[dict]) -> dict[str, int]:
-    """Count how many sources report each unique event (title + date)."""
+def count_source_duplicates(items: list[dict]) -> dict:
+    """Count how many sources report each unique event."""
     event_counts = {}
     for item in items:
         key = (item.get("title", ""), item.get("date", ""))
@@ -154,11 +201,11 @@ def count_source_duplicates(items: list[dict]) -> dict[str, int]:
 # ==================== MAIN PIPELINE ====================
 
 def run_pipeline():
-    """Main pipeline execution."""
-    print("Starting fake news pipeline...")
+    """Main pipeline execution with HDFS support."""
+    print(f"Starting fake news pipeline... (HDFS: {'enabled' if USE_HDFS else 'disabled'})")
 
     # Step 1: Load raw data
-    print("Loading raw data from output/raw/*/")
+    print(f"Loading raw data from {RAW_DIR}")
     raw_data = load_raw_data(RAW_DIR)
     print(f"Loaded {len(raw_data)} raw items")
 
@@ -180,7 +227,7 @@ def run_pipeline():
         }
         cleaned_data.append(cleaned)
 
-    # Step 3: Remove duplicates (same title + date)
+    # Step 3: Remove duplicates
     print("Removing duplicates...")
     seen = set()
     unique_data = []
@@ -193,7 +240,7 @@ def run_pipeline():
 
     print(f"Removed {len(cleaned_data) - len(unique_data)} duplicates")
 
-    # Step 4: Count source duplicates for trust boost
+    # Step 4: Count source duplicates
     event_counts = count_source_duplicates(unique_data)
 
     # Step 5: Verify news
@@ -202,22 +249,16 @@ def run_pipeline():
 
     processed_data = []
     for item in unique_data:
-        # Get base verification score
         verification_score = get_verification_score(item, afp_data)
-
-        # Boost score if multiple sources report same event
         key = (item["title"], item["date"])
         source_count = event_counts.get(key, 1)
         if source_count >= 2:
             verification_score = min(1.0, verification_score + 0.1 * (source_count - 1))
 
-        # Determine if verified (score >= 0.7)
-        is_verified = verification_score >= 0.7
-
         processed_item = {
             **item,
             "verification_score": verification_score,
-            "is_verified": is_verified,
+            "is_verified": verification_score >= 0.7,
             "scrape_timestamp": datetime.now().isoformat(),
             "run_id": generate_run_id(),
         }
@@ -227,19 +268,15 @@ def run_pipeline():
 
     # Step 6: Save processed data
     run_id = generate_run_id()
-    processed_dir = Path(PROCESSED_DIR)
-    processed_dir.mkdir(parents=True, exist_ok=True)
+    _hdfs_mkdir(PROCESSED_DIR)
 
-    # Convert to DataFrame and save as Parquet
-    df = pd.DataFrame(processed_data)
-    parquet_path = processed_dir / f"{run_id}.parquet"
+    parquet_path = f"{PROCESSED_DIR}/{run_id}.parquet"
+    csv_path = f"{PROCESSED_DIR}/{run_id}.csv"
 
     print(f"Saving processed data to {parquet_path}")
-    df.to_parquet(parquet_path, index=False)
-
-    # Also save as CSV for easy inspection
-    csv_path = processed_dir / f"{run_id}.csv"
-    df.to_csv(csv_path, index=False)
+    df = pd.DataFrame(processed_data)
+    _hdfs_write_parquet(df, parquet_path)
+    _hdfs_write_csv(df, csv_path)
 
     print(f"Pipeline complete! Processed {len(processed_data)} items.")
     print(f"Saved to: {parquet_path}")
